@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SLT 購入（Sepolia）</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans JP", "Apple Color Emoji", "Segoe UI Emoji"; }
+    body { margin: 0; background: #0b0d10; color: #e8ecef; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 24px; }
+    .card { background: #12161b; border: 1px solid #1e242b; border-radius: 16px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+    h1 { margin: 0 0 12px; font-size: 22px; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; }
+    button { cursor: pointer; border: 1px solid #2a3038; background: #1a2028; color: #e8ecef; border-radius: 12px; padding: 10px 14px; font-weight: 600; }
+    button.primary { background: #2a6df4; border-color: #2a6df4; color: white; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    input, select { width: 100%; box-sizing: border-box; border-radius: 12px; border: 1px solid #2a3038; background: #0e1318; color: #e8ecef; padding: 10px 12px; }
+    .grid { display: grid; gap: 14px; }
+    .muted { color: #9aa6b2; font-size: 12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .hr { height: 1px; background: #1e242b; margin: 14px 0; }
+    .pill { background: #0f1720; border: 1px solid #253041; padding: 6px 10px; border-radius: 999px; font-size: 12px; display: inline-block; }
+    .warn { color: #ffb74d; }
+    a { color: #7db1ff; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card grid">
+      <h1>SLT 購入（Sepolia）</h1>
+      <div class="muted">このページからコントラクトの <code>buyWithETH</code> を呼び出して少数枚の購入ができます。</div>
+
+      <div class="row">
+        <div class="grid">
+          <label class="muted">コントラクトアドレス</label>
+          <input id="addr" value="0x5a4f4f12242a74094E936B78CA4d7b01415A0cA9" />
+        </div>
+        <div><button id="useAddr">読み込む</button></div>
+      </div>
+
+      <div class="row">
+        <div class="grid">
+          <label class="muted">購入量（枚 / SLT）</label>
+          <input id="amount" type="number" step="0.000000000000000001" value="0.001" />
+        </div>
+        <div class="grid" style="width: 180px;">
+          <label class="muted">ネットワーク</label>
+          <select id="network">
+            <option value="11155111" selected>Sepolia</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="grid">
+          <button id="btnConnect">ウォレット接続</button>
+        </div>
+        <div class="grid">
+          <button class="primary" id="btnQuote" disabled>見積り（quoteAll）</button>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div id="out" class="grid"></div>
+
+      <div class="row">
+        <div class="grid">
+          <div class="muted">必要ETH(wei)に+0.1%のバッファを自動付与します。</div>
+        </div>
+        <div class="grid">
+          <button class="primary" id="btnBuy" disabled>購入（buyWithETH）</button>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+      <div class="muted">
+        注意: 本サイトはテストネット(Sepolia)向けです。<br/>
+        失敗する場合は、オラクルの更新やガス、ネットワーク切替をご確認ください。
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    // ===== Minimal ethers v6 loader from CDN =====
+    import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.min.js";
+
+    // ===== Contract ABI (必要な関数だけ) =====
+    const ABI = [
+      // ERC20 基本
+      "function name() view returns (string)",
+      "function symbol() view returns (string)",
+      "function decimals() view returns (uint8)",
+      "function balanceOf(address) view returns (uint256)",
+      // 本件の関数
+      "function quoteAll(uint256 dS) view returns (uint256 sNow,uint256 price_btc_e8,uint256 price_eth_1e18,uint256 price_usd_1e6,uint256 cost_btc_e8,uint256 cost_eth_1e18,uint256 cost_usd_1e6,uint256 btcUsd_e8,uint256 ethUsd_e8)",
+      "function buyWithETH(uint256 dS, uint256 maxPayETH) payable",
+      "function DAO() view returns (address)",
+      "function S() view returns (uint256)",
+      "function priceBtc(uint256 s) view returns (uint256)",
+      "function progressBTC() view returns (uint256,uint256)"
+    ];
+
+    // ===== Elements =====
+    const $ = (q)=>document.querySelector(q);
+    const addrInput = $("#addr");
+    const amountInput = $("#amount");
+    const btnConnect = $("#btnConnect");
+    const btnQuote = $("#btnQuote");
+    const btnBuy = $("#btnBuy");
+    const out = $("#out");
+    const useAddr = $("#useAddr");
+
+    const CHAIN_ID = 11155111; // Sepolia
+
+    let provider, signer, account, contract, decimals = 18, symbol = "SLT";
+    let lastQuote = null; // 保持
+
+    function log(lines) {
+      const div = document.createElement('div');
+      div.className = 'pill mono';
+      if (Array.isArray(lines)) div.textContent = lines.join(' ');
+      else div.textContent = String(lines);
+      out.prepend(div);
+    }
+
+    async function ensureSepolia() {
+      if (!window.ethereum) throw new Error("ウォレット(例えばMetaMask)が必要です");
+      const current = await window.ethereum.request({ method: 'eth_chainId' });
+      const cid = parseInt(current, 16);
+      if (cid !== CHAIN_ID) {
+        // 可能ならネットワーク切替
+        try {
+          await window.ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: '0xAA36A7' }], // 11155111
+          });
+        } catch (e) {
+          throw new Error("MetaMaskでSepoliaに切り替えてください");
+        }
+      }
+    }
+
+    async function connect() {
+      await ensureSepolia();
+      provider = new ethers.BrowserProvider(window.ethereum);
+      const accs = await provider.send('eth_requestAccounts', []);
+      account = accs[0];
+      signer = await provider.getSigner();
+      btnQuote.disabled = false;
+      log(["接続:", account]);
+      await loadContract();
+    }
+
+    async function loadContract() {
+      const address = addrInput.value.trim();
+      if (!ethers.isAddress(address)) {
+        log("コントラクトアドレスが不正です");
+        return;
+      }
+      contract = new ethers.Contract(address, ABI, signer ?? (provider || new ethers.JsonRpcProvider("https://rpc.sepolia.org")));
+      try {
+        const [nm, sy, dec, dao] = await Promise.all([
+          contract.name(), contract.symbol(), contract.decimals(), contract.DAO()
+        ]);
+        decimals = Number(dec);
+        symbol = sy;
+        log([`読込: ${nm} (${sy}) / decimals=${dec} / DAO=${dao}`]);
+      } catch (e) {
+        console.error(e);
+        log("コントラクト読込に失敗しました（Etherscan未検証でも動作はします）");
+      }
+    }
+
+    function toWeiTokens(amount) {
+      // amount(枚) → wei単位（decimals採用, 通常18）
+      return ethers.parseUnits(String(amount), decimals);
+    }
+
+    function fmtEth(wei) {
+      try { return ethers.formatEther(wei); } catch { return String(wei); }
+    }
+
+    async function doQuote() {
+      if (!contract) await loadContract();
+      const amt = parseFloat(amountInput.value || '0');
+      if (!(amt > 0)) return log("購入量を入力してください");
+      const dS = toWeiTokens(amt);
+      log([`見積り dS=${dS.toString()}`]);
+      try {
+        const q = await contract.quoteAll(dS);
+        lastQuote = q; // 保持
+        const costWei = q.cost_eth_1e18 ?? q[5];
+        const priceWei = q.price_eth_1e18 ?? q[2];
+        const btcUsd = q.btcUsd_e8 ?? q[7];
+        const ethUsd = q.ethUsd_e8 ?? q[8];
+        log([`現在価格(1枚): ~${fmtEth(priceWei)} ETH`]);
+        log([`必要ETH(合計): ~${fmtEth(costWei)} ETH`]);
+        log([`参考: BTC/USD=${Number(btcUsd)/1e8}, ETH/USD=${Number(ethUsd)/1e8}`]);
+        btnBuy.disabled = false;
+      } catch (e) {
+        console.error(e);
+        btnBuy.disabled = true;
+        log("見積りに失敗しました（オラクル停止や入力値を確認）");
+      }
+    }
+
+    async function doBuy() {
+      if (!contract || !signer || !lastQuote) return log("まずウォレット接続と見積りをしてください");
+      const amt = parseFloat(amountInput.value || '0');
+      if (!(amt > 0)) return log("購入量を入力してください");
+      const dS = toWeiTokens(amt);
+      const need = (lastQuote.cost_eth_1e18 ?? lastQuote[5]);
+      // +0.1%バッファ
+      const buffer = (need * 1n) / 1000n;
+      const maxPay = need + buffer;
+      try {
+        const tx = await contract.buyWithETH(dS, maxPay, { value: maxPay });
+        log(["送信:", tx.hash]);
+        const rc = await tx.wait();
+        log(["確定ブロック:", rc.blockNumber]);
+      } catch (e) {
+        console.error(e);
+        log("購入に失敗しました（残高/ガス/スリッページを確認）");
+      }
+    }
+
+    btnConnect.addEventListener('click', connect);
+    btnQuote.addEventListener('click', doQuote);
+    btnBuy.addEventListener('click', doBuy);
+    useAddr.addEventListener('click', loadContract);
+
+    // 初期ロード試行
+    loadContract();
+  </script>
+</body>
+</html>

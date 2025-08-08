@@ -28,7 +28,7 @@
   <div class="wrap">
     <div class="card grid">
       <h1>SLT 購入（Sepolia）</h1>
-      <div class="muted">このページからコントラクトの <code>buyWithETH</code> を呼び出して少数枚の購入ができます。</div>
+      <div class="muted">このページからコントラクトの <code>buyWithETH</code> を呼べます。大口対応済み（精度ロスなし・直前再見積り・1%バッファ）。</div>
 
       <div class="row">
         <div class="grid">
@@ -41,7 +41,8 @@
       <div class="row">
         <div class="grid">
           <label class="muted">購入量（枚 / SLT）</label>
-          <input id="amount" type="number" step="0.000000000000000001" value="0.001" />
+          <!-- number型だと精度が壊れるので text + 正規表現チェック -->
+          <input id="amount" type="text" inputmode="decimal" placeholder="例: 0.001" value="0.001" />
         </div>
         <div class="grid" style="width: 180px;">
           <label class="muted">ネットワーク</label>
@@ -66,7 +67,7 @@
 
       <div class="row">
         <div class="grid">
-          <div class="muted">必要ETH(wei)に+0.1%のバッファを自動付与します。</div>
+          <div class="muted">送信直前に再見積りし、必要ETHに<b>+1%</b>を <code>maxPayETH</code> として付与（超過は自動返金）。</div>
         </div>
         <div class="grid">
           <button class="primary" id="btnBuy" disabled>購入（buyWithETH）</button>
@@ -76,23 +77,21 @@
       <div class="hr"></div>
       <div class="muted">
         注意: 本サイトはテストネット(Sepolia)向けです。<br/>
-        失敗する場合は、オラクルの更新やガス、ネットワーク切替をご確認ください。
+        失敗する場合は、オラクル更新・ガス・ネットワーク切替をご確認ください。
       </div>
     </div>
   </div>
 
   <script type="module">
-    // ===== Minimal ethers v6 loader from CDN =====
+    // ===== ethers v6 from CDN =====
     import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.min.js";
 
     // ===== Contract ABI (必要な関数だけ) =====
     const ABI = [
-      // ERC20 基本
       "function name() view returns (string)",
       "function symbol() view returns (string)",
       "function decimals() view returns (uint8)",
       "function balanceOf(address) view returns (uint256)",
-      // 本件の関数
       "function quoteAll(uint256 dS) view returns (uint256 sNow,uint256 price_btc_e8,uint256 price_eth_1e18,uint256 price_usd_1e6,uint256 cost_btc_e8,uint256 cost_eth_1e18,uint256 cost_usd_1e6,uint256 btcUsd_e8,uint256 ethUsd_e8)",
       "function buyWithETH(uint256 dS, uint256 maxPayETH) payable",
       "function DAO() view returns (address)",
@@ -114,22 +113,19 @@
     const CHAIN_ID = 11155111; // Sepolia
 
     let provider, signer, account, contract, decimals = 18, symbol = "SLT";
-    let lastQuote = null; // 保持
 
     function log(lines) {
       const div = document.createElement('div');
       div.className = 'pill mono';
-      if (Array.isArray(lines)) div.textContent = lines.join(' ');
-      else div.textContent = String(lines);
+      div.textContent = Array.isArray(lines) ? lines.join(' ') : String(lines);
       out.prepend(div);
     }
 
     async function ensureSepolia() {
-      if (!window.ethereum) throw new Error("ウォレット(例えばMetaMask)が必要です");
+      if (!window.ethereum) throw new Error("ウォレット(例: MetaMask)が必要です");
       const current = await window.ethereum.request({ method: 'eth_chainId' });
       const cid = parseInt(current, 16);
       if (cid !== CHAIN_ID) {
-        // 可能ならネットワーク切替
         try {
           await window.ethereum.request({
             method: 'wallet_switchEthereumChain',
@@ -148,17 +144,16 @@
       account = accs[0];
       signer = await provider.getSigner();
       btnQuote.disabled = false;
+      btnBuy.disabled = false; // 再見積りしてから送るので有効でOK
       log(["接続:", account]);
       await loadContract();
     }
 
     async function loadContract() {
       const address = addrInput.value.trim();
-      if (!ethers.isAddress(address)) {
-        log("コントラクトアドレスが不正です");
-        return;
-      }
-      contract = new ethers.Contract(address, ABI, signer ?? (provider || new ethers.JsonRpcProvider("https://rpc.sepolia.org")));
+      if (!ethers.isAddress(address)) { log("コントラクトアドレスが不正です"); return; }
+      const rp = signer ?? (provider || new ethers.JsonRpcProvider("https://rpc.sepolia.org"));
+      contract = new ethers.Contract(address, ABI, rp);
       try {
         const [nm, sy, dec, dao] = await Promise.all([
           contract.name(), contract.symbol(), contract.decimals(), contract.DAO()
@@ -168,28 +163,29 @@
         log([`読込: ${nm} (${sy}) / decimals=${dec} / DAO=${dao}`]);
       } catch (e) {
         console.error(e);
-        log("コントラクト読込に失敗しました（Etherscan未検証でも動作はします）");
+        log("コントラクト読込に失敗しました（Etherscan未検証でも動作可）");
       }
     }
 
-    function toWeiTokens(amount) {
-      // amount(枚) → wei単位（decimals採用, 通常18）
-      return ethers.parseUnits(String(amount), decimals);
+    function validAmountStr(s) {
+      return /^\d+(\.\d+)?$/.test(s);
     }
-
+    function toWeiTokens(amountStr) {
+      // 入力文字列をそのまま parseUnits（精度ロス回避）
+      return ethers.parseUnits(amountStr, decimals);
+    }
     function fmtEth(wei) {
       try { return ethers.formatEther(wei); } catch { return String(wei); }
     }
 
     async function doQuote() {
       if (!contract) await loadContract();
-      const amt = parseFloat(amountInput.value || '0');
-      if (!(amt > 0)) return log("購入量を入力してください");
-      const dS = toWeiTokens(amt);
+      const amtStr = (amountInput.value || '').trim();
+      if (!validAmountStr(amtStr)) return log("購入量を 0.001 の形式で入力してください");
+      const dS = toWeiTokens(amtStr);
       log([`見積り dS=${dS.toString()}`]);
       try {
         const q = await contract.quoteAll(dS);
-        lastQuote = q; // 保持
         const costWei = q.cost_eth_1e18 ?? q[5];
         const priceWei = q.price_eth_1e18 ?? q[2];
         const btcUsd = q.btcUsd_e8 ?? q[7];
@@ -197,31 +193,35 @@
         log([`現在価格(1枚): ~${fmtEth(priceWei)} ETH`]);
         log([`必要ETH(合計): ~${fmtEth(costWei)} ETH`]);
         log([`参考: BTC/USD=${Number(btcUsd)/1e8}, ETH/USD=${Number(ethUsd)/1e8}`]);
-        btnBuy.disabled = false;
       } catch (e) {
         console.error(e);
-        btnBuy.disabled = true;
         log("見積りに失敗しました（オラクル停止や入力値を確認）");
       }
     }
 
     async function doBuy() {
-      if (!contract || !signer || !lastQuote) return log("まずウォレット接続と見積りをしてください");
-      const amt = parseFloat(amountInput.value || '0');
-      if (!(amt > 0)) return log("購入量を入力してください");
-      const dS = toWeiTokens(amt);
-      const need = (lastQuote.cost_eth_1e18 ?? lastQuote[5]);
-      // +0.1%バッファ
-      const buffer = (need * 1n) / 1000n;
-      const maxPay = need + buffer;
+      if (!contract || !signer) return log("まずウォレット接続してください");
+      const amtStr = (amountInput.value || '').trim();
+      if (!validAmountStr(amtStr)) return log("購入量を 0.001 の形式で入力してください");
+      const dS = toWeiTokens(amtStr);
+
       try {
+        // ★送信直前に再見積り（S/オラクルの変化吸収）
+        const fresh = await contract.quoteAll(dS);
+        const need = (fresh.cost_eth_1e18 ?? fresh[5]);
+
+        // ★+1%バッファ（maxPayETH = need * 1.01）
+        const maxPay = (need * 101n) / 100n;
+
+        // ★value = maxPay（余剰はコントラクト側で即返金）
         const tx = await contract.buyWithETH(dS, maxPay, { value: maxPay });
         log(["送信:", tx.hash]);
         const rc = await tx.wait();
-        log(["確定ブロック:", rc.blockNumber]);
+        log([`確定ブロック: ${rc.blockNumber}`]);
       } catch (e) {
         console.error(e);
-        log("購入に失敗しました（残高/ガス/スリッページを確認）");
+        // よくある失敗原因を添える
+        log("購入に失敗：残高不足 / ガス不足 / オラクル一時停止 / 48h転送アウト禁止 などを確認");
       }
     }
 

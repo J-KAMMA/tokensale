@@ -20,7 +20,10 @@
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
     .hr { height: 1px; background: #1e242b; margin: 14px 0; }
     .pill { background: #0f1720; border: 1px solid #253041; padding: 6px 10px; border-radius: 999px; font-size: 12px; display: inline-block; }
-    .warn { color: #ffb74d; }
+    .stats { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+    .stat { background:#0f1720; border:1px solid #253041; border-radius:12px; padding:10px 12px; }
+    .stat .label { font-size:12px; color:#9aa6b2; }
+    .stat .val { font-size:16px; font-weight:700; margin-top:4px; }
     a { color: #7db1ff; }
   </style>
 </head>
@@ -28,7 +31,29 @@
   <div class="wrap">
     <div class="card grid">
       <h1>SLT 購入（Sepolia）</h1>
-      <div class="muted">このページからコントラクトの <code>buyWithETH</code> を呼べます。大口対応済み（精度ロスなし・直前再見積り・1%バッファ）。</div>
+      <div class="muted">精度ロスなし・直前再見積り・1%バッファ。ETH/SLT残高と、見積りでUSDも併記します。</div>
+
+      <!-- 残高・所持 -->
+      <div class="stats">
+        <div class="stat">
+          <div class="label">接続アドレス</div>
+          <div class="val mono" id="addrShort">未接続</div>
+        </div>
+        <div class="stat">
+          <div class="label">ETH 残高</div>
+          <div class="val mono" id="ethBal">-</div>
+        </div>
+        <div class="stat">
+          <div class="label">所持 SLT</div>
+          <div class="val mono" id="sltBal">-</div>
+        </div>
+        <div class="stat">
+          <div class="label">コントラクト</div>
+          <div class="val mono" id="tokenMeta">-</div>
+        </div>
+      </div>
+
+      <div class="hr"></div>
 
       <div class="row">
         <div class="grid">
@@ -41,7 +66,6 @@
       <div class="row">
         <div class="grid">
           <label class="muted">購入量（枚 / SLT）</label>
-          <!-- number型だと精度が壊れるので text + 正規表現チェック -->
           <input id="amount" type="text" inputmode="decimal" placeholder="例: 0.001" value="0.001" />
         </div>
         <div class="grid" style="width: 180px;">
@@ -56,8 +80,9 @@
         <div class="grid">
           <button id="btnConnect">ウォレット接続</button>
         </div>
-        <div class="grid">
-          <button class="primary" id="btnQuote" disabled>見積り（quoteAll）</button>
+        <div class="grid" style="grid-template-columns:auto auto; gap:8px;">
+          <button class="primary" id="btnQuote" disabled>見積り</button>
+          <button id="btnRefresh" disabled>残高更新</button>
         </div>
       </div>
 
@@ -67,7 +92,7 @@
 
       <div class="row">
         <div class="grid">
-          <div class="muted">送信直前に再見積りし、必要ETHに<b>+1%</b>を <code>maxPayETH</code> として付与（超過は自動返金）。</div>
+          <div class="muted">送信直前に再見積り。必要ETHに<b>+1%</b>を <code>maxPayETH</code> として送信（余剰は自動返金）。</div>
         </div>
         <div class="grid">
           <button class="primary" id="btnBuy" disabled>購入（buyWithETH）</button>
@@ -76,17 +101,14 @@
 
       <div class="hr"></div>
       <div class="muted">
-        注意: 本サイトはテストネット(Sepolia)向けです。<br/>
-        失敗する場合は、オラクル更新・ガス・ネットワーク切替をご確認ください。
+        テストネット(Sepolia)用。失敗時はオラクル更新・ガス・ネットワーク切替をご確認ください。
       </div>
     </div>
   </div>
 
   <script type="module">
-    // ===== ethers v6 from CDN =====
     import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.min.js";
 
-    // ===== Contract ABI (必要な関数だけ) =====
     const ABI = [
       "function name() view returns (string)",
       "function symbol() view returns (string)",
@@ -95,20 +117,22 @@
       "function quoteAll(uint256 dS) view returns (uint256 sNow,uint256 price_btc_e8,uint256 price_eth_1e18,uint256 price_usd_1e6,uint256 cost_btc_e8,uint256 cost_eth_1e18,uint256 cost_usd_1e6,uint256 btcUsd_e8,uint256 ethUsd_e8)",
       "function buyWithETH(uint256 dS, uint256 maxPayETH) payable",
       "function DAO() view returns (address)",
-      "function S() view returns (uint256)",
-      "function priceBtc(uint256 s) view returns (uint256)",
-      "function progressBTC() view returns (uint256,uint256)"
+      "function S() view returns (uint256)"
     ];
 
-    // ===== Elements =====
     const $ = (q)=>document.querySelector(q);
     const addrInput = $("#addr");
     const amountInput = $("#amount");
     const btnConnect = $("#btnConnect");
     const btnQuote = $("#btnQuote");
     const btnBuy = $("#btnBuy");
+    const btnRefresh = $("#btnRefresh");
     const out = $("#out");
     const useAddr = $("#useAddr");
+    const addrShort = $("#addrShort");
+    const ethBalEl = $("#ethBal");
+    const sltBalEl = $("#sltBal");
+    const tokenMeta = $("#tokenMeta");
 
     const CHAIN_ID = 11155111; // Sepolia
 
@@ -120,6 +144,7 @@
       div.textContent = Array.isArray(lines) ? lines.join(' ') : String(lines);
       out.prepend(div);
     }
+    const short = (addr)=> addr ? (addr.slice(0,6)+"…"+addr.slice(-4)) : "-";
 
     async function ensureSepolia() {
       if (!window.ethereum) throw new Error("ウォレット(例: MetaMask)が必要です");
@@ -143,10 +168,19 @@
       const accs = await provider.send('eth_requestAccounts', []);
       account = accs[0];
       signer = await provider.getSigner();
+      addrShort.textContent = short(account);
       btnQuote.disabled = false;
-      btnBuy.disabled = false; // 再見積りしてから送るので有効でOK
+      btnBuy.disabled = false;
+      btnRefresh.disabled = false;
       log(["接続:", account]);
       await loadContract();
+      await refreshBalances();
+      window.ethereum?.on?.('accountsChanged', async (a)=>{
+        account = a[0]; addrShort.textContent = short(account);
+        signer = await provider.getSigner();
+        await refreshBalances();
+      });
+      window.ethereum?.on?.('chainChanged', ()=>location.reload());
     }
 
     async function loadContract() {
@@ -155,27 +189,37 @@
       const rp = signer ?? (provider || new ethers.JsonRpcProvider("https://rpc.sepolia.org"));
       contract = new ethers.Contract(address, ABI, rp);
       try {
-        const [nm, sy, dec, dao] = await Promise.all([
-          contract.name(), contract.symbol(), contract.decimals(), contract.DAO()
-        ]);
+        const [nm, sy, dec] = await Promise.all([contract.name(), contract.symbol(), contract.decimals()]);
         decimals = Number(dec);
         symbol = sy;
-        log([`読込: ${nm} (${sy}) / decimals=${dec} / DAO=${dao}`]);
+        tokenMeta.textContent = `${nm} (${sy}) · decimals=${dec}`;
+        log([`読込: ${nm} (${sy}) / decimals=${dec}`]);
       } catch (e) {
         console.error(e);
+        tokenMeta.textContent = "読込失敗";
         log("コントラクト読込に失敗しました（Etherscan未検証でも動作可）");
       }
     }
 
-    function validAmountStr(s) {
-      return /^\d+(\.\d+)?$/.test(s);
-    }
-    function toWeiTokens(amountStr) {
-      // 入力文字列をそのまま parseUnits（精度ロス回避）
-      return ethers.parseUnits(amountStr, decimals);
-    }
-    function fmtEth(wei) {
-      try { return ethers.formatEther(wei); } catch { return String(wei); }
+    function validAmountStr(s) { return /^\d+(\.\d+)?$/.test(s); }
+    function toWeiTokens(amountStr) { return ethers.parseUnits(amountStr, decimals); }
+    function fmtEth(wei) { try { return ethers.formatEther(wei); } catch { return String(wei); } }
+    function fmtUnits(v, d) { try { return ethers.formatUnits(v, d); } catch { return String(v); } }
+
+    async function refreshBalances() {
+      try {
+        if (!provider || !account) return;
+        const bal = await provider.getBalance(account);
+        ethBalEl.textContent = `${fmtEth(bal)} ETH`;
+      } catch { ethBalEl.textContent = "-"; }
+      try {
+        if (contract && account) {
+          const bal = await contract.balanceOf(account);
+          sltBalEl.textContent = `${fmtUnits(bal, decimals)} ${symbol}`;
+        } else {
+          sltBalEl.textContent = "-";
+        }
+      } catch { sltBalEl.textContent = "-"; }
     }
 
     async function doQuote() {
@@ -188,11 +232,14 @@
         const q = await contract.quoteAll(dS);
         const costWei = q.cost_eth_1e18 ?? q[5];
         const priceWei = q.price_eth_1e18 ?? q[2];
-        const btcUsd = q.btcUsd_e8 ?? q[7];
-        const ethUsd = q.ethUsd_e8 ?? q[8];
-        log([`現在価格(1枚): ~${fmtEth(priceWei)} ETH`]);
-        log([`必要ETH(合計): ~${fmtEth(costWei)} ETH`]);
-        log([`参考: BTC/USD=${Number(btcUsd)/1e8}, ETH/USD=${Number(ethUsd)/1e8}`]);
+        const priceUsd = q.price_usd_1e6 ?? q[3];
+        const costUsd  = q.cost_usd_1e6  ?? q[6];
+        const btcUsd   = q.btcUsd_e8     ?? q[7];
+        const ethUsd   = q.ethUsd_e8     ?? q[8];
+
+        log([`1枚価格: ~${fmtEth(priceWei)} ETH / $${(Number(priceUsd)/1e6).toFixed(2)}`]);
+        log([`合計必要: ~${fmtEth(costWei)} ETH / $${(Number(costUsd)/1e6).toFixed(2)}`]);
+        log([`参考: BTC/USD=${(Number(btcUsd)/1e8).toFixed(2)}, ETH/USD=${(Number(ethUsd)/1e8).toFixed(2)}`]);
       } catch (e) {
         console.error(e);
         log("見積りに失敗しました（オラクル停止や入力値を確認）");
@@ -206,32 +253,33 @@
       const dS = toWeiTokens(amtStr);
 
       try {
-        // ★送信直前に再見積り（S/オラクルの変化吸収）
+        // 直前再見積り
         const fresh = await contract.quoteAll(dS);
         const need = (fresh.cost_eth_1e18 ?? fresh[5]);
+        const costUsd = (fresh.cost_usd_1e6 ?? fresh[6]);
+        const maxPay = (need * 101n) / 100n; // +1%
 
-        // ★+1%バッファ（maxPayETH = need * 1.01）
-        const maxPay = (need * 101n) / 100n;
-
-        // ★value = maxPay（余剰はコントラクト側で即返金）
         const tx = await contract.buyWithETH(dS, maxPay, { value: maxPay });
-        log(["送信:", tx.hash]);
+        log([`送信: ${tx.hash}`]);
         const rc = await tx.wait();
         log([`確定ブロック: ${rc.blockNumber}`]);
+        log([`支払(概算): ~${fmtEth(need)} ETH / $${(Number(costUsd)/1e6).toFixed(2)}`]);
+
+        setTimeout(refreshBalances, 1500);
       } catch (e) {
         console.error(e);
-        // よくある失敗原因を添える
-        log("購入に失敗：残高不足 / ガス不足 / オラクル一時停止 / 48h転送アウト禁止 などを確認");
+        log("購入に失敗：残高不足 / ガス不足 / オラクル一時停止 / 48h転送アウト禁止 を確認");
       }
     }
 
     btnConnect.addEventListener('click', connect);
     btnQuote.addEventListener('click', doQuote);
     btnBuy.addEventListener('click', doBuy);
-    useAddr.addEventListener('click', loadContract);
+    btnRefresh.addEventListener('click', refreshBalances);
+    useAddr.addEventListener('click', async ()=>{ await loadContract(); await refreshBalances(); });
 
-    // 初期ロード試行
-    loadContract();
+    // 初期ロード
+    (async ()=>{ await loadContract(); })();
   </script>
 </body>
 </html>
